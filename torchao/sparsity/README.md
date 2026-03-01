@@ -80,7 +80,8 @@ quantize_(
 Notes:
 - This path is implemented by `Sparse2x4CUTLASSFloat8Tensor` and validated in `test/quantization/quantize_/workflows/float8/test_sparse_2x4_cutlass_float8_tensor.py`.
 - It requires SM90+ GPUs (for example H100).
-- The repository does **not** currently contain a landed public API for FP8 composition with 2:4 **activation** sparsity. `benchmarks/benchmark_e2e_fp8_sparse_linear.py` references a prototype config (`SRELUFloat8SemiSparseDynamicActivationFloat8WeightConfig`) that is not present in this tree.
+- The repository does **not** currently contain a landed public API for FP8 composition with 2:4 **activation** sparsity.
+- `benchmarks/benchmark_e2e_fp8_sparse_linear.py` references a prototype config (`SRELUFloat8SemiSparseDynamicActivationFloat8WeightConfig`) that is not present in this tree.
 
 ### 2:4 sparsity
 
