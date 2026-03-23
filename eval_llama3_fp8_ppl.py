@@ -3,7 +3,7 @@ import os
 import time
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 from datasets import load_dataset, load_from_disk
@@ -20,11 +20,19 @@ from torchao.quantization import (
 from torchao.quantization.quant_api import _float8_cutlass_quant
 
 
-
 class FP8IdentitySemiSparseActivationLinear(nn.Module):
     """
     Runtime activation 2:4 sparsity + FP8 activation/weight Linear.
     Designed for Llama3 MLP down_proj where SiLU-gated activation already happened upstream.
+
+    Uses the same kernel pair as torchao/prototype/sparsity/activation/srelu_linear.py:
+      sparse24_sm90_sparsify  (activation sparsify)
+      + rowwise_scaled_linear_sparse_cutlass_f8f8  (sparse-activation GEMM)
+    These two are designed to work together and share the same metadata format.
+
+    NOTE: rowwise_scaled_linear_sparse_cutlass_f8f8 treats the ACTIVATION as the
+    "weight" arg (sparse side) and the dense weight as the "input" arg, computing
+    W @ X^T -> [N, M], then .t().contiguous() -> [M, N].
     """
 
     def __init__(
@@ -35,33 +43,49 @@ class FP8IdentitySemiSparseActivationLinear(nn.Module):
     ) -> None:
         super().__init__()
         self.activation_dtype = activation_dtype
-        self.weight_dtype = weight_dtype
 
-        w_aqt = _float8_cutlass_quant(weight, self.weight_dtype)
-        self.wq = w_aqt.tensor_impl.float8_data
-        self.w_scale = w_aqt.tensor_impl.scale
+        w_aqt = _float8_cutlass_quant(weight, weight_dtype)
+        self.wq = w_aqt.tensor_impl.float8_data           # [N, K]
+        # rowwise_scaled_linear_sparse_cutlass_f8f8 requires input_scale 1D [N]
+        self.w_scale = w_aqt.tensor_impl.scale.squeeze(-1)  # [N]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_scale = torch.empty([x.shape[0], 1], device=x.device, dtype=torch.float32)
+        orig_shape = x.shape
+        x_2d = x.view(-1, orig_shape[-1])  # [M, K]
+
+        # Step 1: Pre-compute per-row quantization scale.
+        # sparse24_sm90_sparsify reads scale as INPUT to divide the data before
+        # FP8 cast (it does NOT compute the scale). We must provide a valid scale
+        # so that x / x_scale fits within the FP8 range without clipping.
+        max_v = torch.finfo(self.activation_dtype).max
+        x_scale_2d = (x_2d.abs().amax(dim=1, keepdim=True) / max_v).float()  # [M, 1]
+
+        # Step 2: Fused top-2/4 sparsification + per-row FP8 quantization.
+        # sparse24_sm90_sparsify is the paired upstream kernel for
+        # rowwise_scaled_linear_sparse_cutlass_f8f8 (they share the same metadata format).
         xq_sparse, x_meta = torch.ops.torchao.sparse24_sm90_sparsify(
-            x,
+            x_2d,
             "cutlass",
-            "identity",
-            "largest",
+            "identity",  # keep largest-2 of each group-of-4, no extra activation fn
+            "largest_abs",
             dtype=self.activation_dtype,
-            scale=x_scale,
+            scale=x_scale_2d,  # INPUT: kernel computes x_2d / x_scale_2d → FP8
         )
 
-        out = rowwise_scaled_linear_sparse_cutlass_f8f8(
-            self.wq,
-            self.w_scale,
-            xq_sparse,
-            x_meta,
-            x_scale,
+        # Step 3: rowwise_scaled_linear_sparse_cutlass_f8f8(Wq[N,K], Xq_sparse[M,K])
+        #   computes  Wq @ Xq^T  -> [N, M],  then .t() -> [M, N]
+        #   Xq_scale (weight_scale in the API) must be 1D [M].
+        out_2d = rowwise_scaled_linear_sparse_cutlass_f8f8(
+            self.wq,           # input:        [N, K] dense FP8
+            self.w_scale,      # input_scale:  [N] 1D
+            xq_sparse,         # weight:       [M, K/2] sparse FP8
+            x_meta,            # weight_meta
+            x_scale_2d.squeeze(1),  # weight_scale: [M] 1D  (kernel requires 1D)
             bias=None,
             out_dtype=torch.bfloat16,
-        ).t()
-        return out
+        ).t().contiguous()  # [N, M] -> [M, N], contiguous to allow view
+
+        return out_2d.view(*orig_shape[:-1], out_2d.shape[-1])
 
     @classmethod
     def from_dense(cls, linear: nn.Linear):
@@ -215,28 +239,28 @@ def main():
     print(f"Loading model: {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # print("\n" + "=" * 50)
-    # print("Test 1: Baseline (BF16)")
-    # print("=" * 50)
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     model_id,
-    #     dtype=torch.bfloat16,
-    #     device_map=device,
-    # )
+    print("\n" + "=" * 50)
+    print("Test 1: Baseline (BF16)")
+    print("=" * 50)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        device_map=device,
+    )
 
-    # ppl_base, speed_base, mem_base = wiki2_eval(
-    #     model,
-    #     tokenizer,
-    #     dataset_path,
-    #     verbose=False,
-    #     device=device,
-    # )
-    # print(
-    #     f"Baseline -> PPL: {ppl_base:.4f}, Speed: {speed_base:.2f} tok/s, Mem: {mem_base:.2f} GB"
-    # )
+    ppl_base, speed_base, mem_base = wiki2_eval(
+        model,
+        tokenizer,
+        dataset_path,
+        verbose=False,
+        device=device,
+    )
+    print(
+        f"Baseline -> PPL: {ppl_base:.4f}, Speed: {speed_base:.2f} tok/s, Mem: {mem_base:.2f} GB"
+    )
 
-    # del model
-    # torch.cuda.empty_cache()
+    del model
+    torch.cuda.empty_cache()
 
     print("\n" + "=" * 50)
     print("Test 2: Quantized (FP8 W8A8) + Activation 2:4 Sparse")
