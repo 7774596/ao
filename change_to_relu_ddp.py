@@ -1,56 +1,27 @@
-"""
-change_to_relu.py
-
-将 Llama 3 的 SwiGLU 激活函数渐进式替换为 ReLU，
-以在 down_proj 输入处得到自然的激活稀疏性，使其与 2:4 稀疏 GEMM 内核兼容。
-
-背景
-----
-原始 SwiGLU（Llama 3 默认）：
-    H = silu(gate_proj(x)) ⊙ up_proj(x)      # 平滑，激活值无自然零点
-
-ReLU（目标状态）：
-    H = relu(gate_proj(x)) ⊙ up_proj(x)     # gate ≤ 0 精确输出 0
-
-替换后 H 具有大量自然零值，可直接被 sparse24_sm90_sparsify 利用，
-不需要 eval_llama3_fp8_ppl.py 中的强制 top-2/4 裁剪。
-
-训练策略
---------
-1. 平滑过渡（alpha 调度）
-   H = α · relu(gate)⊙up + (1-α) · silu(gate)⊙up
-   alpha 在 [0, ramp_steps] 内从 0 线性增长到 1，之后保持 1。
-
-2. 2:4 激活稀疏正则化（可选）
-   对每 4 个相邻激活值中绝对值最小的 2 个施加 L1 惩罚，
-   主动推动 H 向 2:4 结构靠拢。
-
-3. 可训练参数
-   默认只更新 MLP 层（gate/up/down），冻结 Attention 和 LN，
-   以减少显存占用。可用 --train_all_params 开启全参数微调。
-
-用法示例
---------
-python change_to_relu.py \\
-    --model_id  /data/sza/model/Meta-Llama-3.1-8B \\
-    --dataset_path /data/sza/local_dataset \\
-    --output_dir /data/sza/model/Meta-Llama-3.1-8B-ReluSparse \\
-    --max_steps 2000 \\
-    --ramp_steps 1000 \\
-    --lr 2e-5 \\
-    --sparse_reg 0.01 \\
-    --eval_interval 200
-"""
-
 from __future__ import annotations
 import math
 import argparse
 import os
 import time
+import sys
 from typing import Dict, List, Optional, Tuple
 
+class Logger(object):
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+        self.log.flush()
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # HuggingFace 镜像站（优先于代码中任何网络请求生效）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -65,6 +36,10 @@ import torch.nn.functional as F
 from datasets import load_dataset, load_from_disk
 from torch.optim import AdamW
 from tqdm import tqdm
+from accelerate import Accelerator
+from torch.utils.data import DataLoader, TensorDataset
+import json
+import glob
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -137,8 +112,7 @@ class LlamaMLPReluTransition(nn.Module):
         # 核心修复：把均值便宜补偿加载到 down_proj 输出上
         # 不影响 h 的稀疏度，又抵消了残差流里的 Mean Shift
         out = self.down_proj(h)
-        if alpha > 0:
-            out = out + alpha * self.down_proj_bias
+        out = out + alpha * self.down_proj_bias
         return out
 
     @classmethod
@@ -466,12 +440,23 @@ def load_train_data(tokenizer,
         #             break
         for item in tokenized:
             all_tokens.extend(item["input_ids"] + [tokenizer.eos_token_id])
+            if len(all_tokens) > (fw_tokens - total_tokens) + seq_len:
+                break
 
         # 按 seq_len 切块
-        all_ids = [
+        new_blocks = [
             all_tokens[i:i+seq_len]
             for i in range(0, len(all_tokens) - seq_len, seq_len)
         ]
+        
+        # 只取需要的数量
+        needed_blocks = (fw_tokens - total_tokens) // seq_len
+        if needed_blocks > 0:
+            new_blocks = new_blocks[:needed_blocks]
+            
+        all_ids.extend(new_blocks)
+        total_tokens += len(new_blocks) * seq_len
+        
         del ds, tokenized
 
     print(f"  FineWeb-Edu 完成: {len(all_ids)} 块 ({total_tokens/1e6:.1f}M tokens)")
@@ -578,6 +563,27 @@ def load_eval_data(dataset_path: str, tokenizer,
 # 5.5 KL 蒸馏损失
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def chunked_cross_entropy(logits, targets, chunk_size=256):
+    B, T, V = logits.shape
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = targets[..., 1:].contiguous()
+    
+    total_loss = torch.tensor(0.0, device=logits.device)
+    for i in range(0, T - 1, chunk_size):
+        chunk_logits = shift_logits[:, i:i+chunk_size, :].float()
+        chunk_labels = shift_labels[:, i:i+chunk_size]
+        
+        loss_chunk = F.cross_entropy(
+            chunk_logits.reshape(-1, V),
+            chunk_labels.reshape(-1),
+            reduction='sum'
+        )
+        total_loss += loss_chunk
+        
+    return total_loss / (B * (T - 1))
+
+
 def kl_distill_loss(student_logits: torch.Tensor,
                     teacher_logits: torch.Tensor,
                     temperature: float = 2.0,
@@ -648,29 +654,6 @@ def eval_ppl(model: nn.Module, encodings, sequence_length: int = 2048,
     return ppl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Alpha 调度器
-# ─────────────────────────────────────────────────────────────────────────────
-
-# class AlphaScheduler:
-#     """
-#     线性 alpha 调度：
-#       step  0            → alpha = 0.0  (纯 SwiGLU)
-#       step  ramp_steps   → alpha = 1.0  (纯 ReLU)
-#       step >ramp_steps   → alpha = 1.0  (保持)
-#     """
-
-#     def __init__(self, model: nn.Module, ramp_steps: int) -> None:
-#         self.model = model
-#         self.ramp_steps = ramp_steps
-
-#     def step(self, current_step: int) -> float:
-#         if self.ramp_steps <= 0:
-#             alpha = 1.0
-#         else:
-#             alpha = min(1.0, current_step / self.ramp_steps)
-#         set_alpha(self.model, alpha)
-#         return alpha
 class AlphaScheduler:
     def __init__(self, model, ramp_steps):
         self.model = model
@@ -688,66 +671,77 @@ class AlphaScheduler:
         set_alpha(self.model, alpha)
         return alpha
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. 训练主循环
+# 8. 训练主循环 (DDP重写版)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def infinite_dataloader(dataloader):
+    while True:
+        for batch in dataloader:
+            yield batch
+
 def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] = None,
-          train_ids: Optional[torch.Tensor] = None) -> None:
-    device = next(model.parameters()).device  # 自动检测模型所在设备
-    print(f"\n[训练配置] 学生模型设备: {device}")
-    if teacher_model is not None:
-        teacher_device = next(teacher_model.parameters()).device
-        print(f"[训练配置] 教师模型设备: {teacher_device}")
-    print(f"[训练配置] 数据将在训练时从CPU传输到 {device}\n")
+          train_ids: Optional[torch.Tensor] = None, accelerator=None) -> None:
+    
+    device = accelerator.device
+    if accelerator.is_main_process:
+        print(f"\n[训练配置] 学生模型设备: {device}")
+        if teacher_model is not None:
+            print(f"[训练配置] 教师模型设备: {teacher_model.device}")
+        print(f"[训练配置] 数据将在训练时从CPU传输到 {device}\n")
 
     # ── 冻结非 MLP 参数（可选）──────────────────────────────────────────────
     if not args.train_all_params:
         for name, param in model.named_parameters():
-            # 只保留 mlp 层可训练；embedding/norm/attention 全部冻结
             if ".mlp." not in name:
                 param.requires_grad_(False)
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total     = sum(p.numel() for p in model.parameters())
-        print(f"  可训练参数: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
+        if accelerator.is_main_process:
+            print(f"  可训练参数: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
 
-    # ── 数据 ────────────────────────────────────────────────────────────────
+    # ── 数据加载与Dataloader (多卡数据分发) ──────────────────────────────────
     if train_ids is None:
-        print("加载训练集...")
-        train_ids = load_train_data(
-            tokenizer=tokenizer,
-            seq_len=args.seq_len,
-            max_train_tokens=args.max_train_tokens,
-            dataset_path=args.dataset_path
-        )
-        print(f"  训练块数: {len(train_ids)}")
-    else:
-        print(f"使用预加载的训练数据: {len(train_ids)} 块")
+        if accelerator.is_main_process:
+            print("加载训练集...")
+        with accelerator.main_process_first():
+            train_ids = load_train_data(
+                tokenizer=tokenizer,
+                seq_len=args.seq_len,
+                max_train_tokens=args.max_train_tokens,
+                dataset_path=args.dataset_path
+            )
+    
+    dataset = TensorDataset(train_ids)
+    # DDP 环境下，accelerator.prepare(dataloader) 会自动插入 DistributedSampler
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # 数据留在CPU，训练时按需传输到GPU
-
-    print("加载验证集...")
-    eval_enc = load_eval_data(args.dataset_path, tokenizer, device=device)
+    if accelerator.is_main_process:
+        print("加载验证集...")
+    with accelerator.main_process_first():
+        eval_enc = load_eval_data(args.dataset_path, tokenizer, device=device)
 
     # ── 优化器 & 调度 ────────────────────────────────────────────────────────
-    # 使用8-bit优化器节省显存：AdamW状态从 ~44GB 压缩到 ~11GB
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(
             [p for p in model.parameters() if p.requires_grad],
-            lr=args.lr,
-            weight_decay=0.01,
+            lr=args.lr * accelerator.num_processes, weight_decay=0.01, betas=(0.9, 0.95), min_8bit_size=16384
         )
-        print("  [优化器] 使用 bitsandbytes AdamW8bit，优化器状态压缩75%")
+        
+        if accelerator.is_main_process:
+            print(f"  使用 8-bit AdamW 优化器")
     except ImportError:
-        print("  [警告] bitsandbytes未安装，使用标准AdamW（显存占用更高）")
         optimizer = AdamW(
             [p for p in model.parameters() if p.requires_grad],
-            lr=args.lr,
-            weight_decay=0.01,
+            lr=args.lr * accelerator.num_processes, weight_decay=0.01, betas=(0.9, 0.95)
         )
+        if accelerator.is_main_process:
+            print(f"  [警告] 未安装 bitsandbytes，使用标准 AdamW")
+
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -755,384 +749,344 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
     )
     alpha_scheduler = AlphaScheduler(model, ramp_steps=args.ramp_steps)
 
+    # ── 使用 Accelerate 包装模型、优化器、调度器、数据 ───────────────────────
+    # 注意：Teacher由于被冻结不参与反向传播，不需要包装，只需保持在 device 即可。
+    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, dataloader, lr_scheduler
+    )
+    data_iterator = infinite_dataloader(dataloader)
+
+    # ── 断点接续 (Resume) 的恢复逻辑 ───────────────────────────────────────
+    step = 0
+    if args.resume_from_checkpoint:
+        if os.path.exists(args.resume_from_checkpoint):
+            if accelerator.is_main_process:
+                print(f"\n正在从 {args.resume_from_checkpoint} 恢复训练...")
+            accelerator.load_state(args.resume_from_checkpoint)
+            # 加载 step，并恢复 alpha_scheduler
+            state_file = os.path.join(args.resume_from_checkpoint, "custom_state.json")
+            if os.path.exists(state_file):
+                with open(state_file, "r") as f:
+                    state = json.load(f)
+                    step = state.get("step", 0)
+            
+            # 手动推进 alpha
+            for _ in range(step):
+                alpha_scheduler.step(_ + 1)
+                
+            if accelerator.is_main_process:
+                print(f"成功恢复到第 {step} 步，开始接续训练。")
+        else:
+            if accelerator.is_main_process:
+                print(f"[警告] 传入的 checkpoint 路径 {args.resume_from_checkpoint} 不存在，从头开始训练。")
+
     # ── 稀疏度监控 ───────────────────────────────────────────────────────────
+    # 在DDP模式下，monitor挂钩真实模型: accelerator.unwrap_model(model)
     sparsity_monitor = ActivationSparsityMonitor()
     if args.monitor_sparsity:
-        sparsity_monitor.attach(model)
+        sparsity_monitor.attach(accelerator.unwrap_model(model))
 
     # ── 初始 PPL ────────────────────────────────────────────────────────────
-    print("\n计算初始 PPL（alpha=0，纯 SwiGLU）...")
-    ppl_init = eval_ppl(model, eval_enc)
-    print(f"  初始 PPL: {ppl_init:.4f}")
+    if accelerator.is_main_process and step == 0:
+        print("\n计算初始 PPL（alpha=0，纯 SwiGLU）...")
+        ppl_init = eval_ppl(accelerator.unwrap_model(model), eval_enc)
+        print(f"  初始 PPL: {ppl_init:.4f}")
 
     # ── 训练循环 ────────────────────────────────────────────────────────────
     model.train()
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps * accelerator.num_processes
+    
+    if accelerator.is_main_process:
+        print(f"\n[分布式多卡 & 梯度累积配置]")
+        print(f"  参与设备数: {accelerator.num_processes}")
+        print(f"  单卡 batch_size: {args.batch_size}")
+        print(f"  梯度累积步数: {args.gradient_accumulation_steps}")
+        print(f"  全局有效 batch_size: {effective_batch_size}")
+        print(f"  开始微调：max_steps={args.max_steps}, ramp_steps={args.ramp_steps}, sparse_reg={args.sparse_reg}, lr={args.lr * accelerator.num_processes}\n")
 
-    # 计算有效batch size
-    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
-    print(f"\n[梯度累积配置]")
-    print(f"  实际 batch_size: {args.batch_size}")
-    print(f"  梯度累积步数: {args.gradient_accumulation_steps}")
-    print(f"  有效 batch_size: {effective_batch_size}")
-    print(f"  每步处理 tokens: {args.batch_size * args.seq_len:,}")
-    print(f"  每次更新处理 tokens: {effective_batch_size * args.seq_len:,}\n")
+    pbar = tqdm(total=args.max_steps, desc="ReLU-ification 微调 (DDP)", disable=not accelerator.is_main_process, initial=step)
+    alpha = alpha_scheduler.step(step)
 
-    step = 0
-    total_loss = 0.0
-    total_lm_loss = 0.0
-    total_ce_loss = 0.0
-    total_kl_loss = 0.0
-    total_sparse_loss = 0.0
-    N = len(train_ids)
-    pbar = tqdm(total=args.max_steps, desc="ReLU-ification 微调")
-
-    print(f"\n开始微调：max_steps={args.max_steps}, ramp_steps={args.ramp_steps}, "
-          f"sparse_reg={args.sparse_reg}, lr={args.lr}")
-
-    optimizer.zero_grad()  # 初始化梯度
+    # Variables for logging
+    log_loss, log_ce, log_kl, log_h_sparse = 0.0, 0.0, 0.0, 0.0
 
     while step < args.max_steps:
-        # ── 梯度累积循环 ─────────────────────────────────────────────────
-        alpha = alpha_scheduler.step(step)
-        for accumulation_step in range(args.gradient_accumulation_steps):
-            # 随机采样一个 batch
-            idx = torch.randint(0, N, (args.batch_size,))
-            input_ids = train_ids[idx].to(device)          # [B, seq_len]
-            labels    = input_ids.clone()
+        # Accelerate handles gradient accumulation context automatically
+        with accelerator.accumulate(model):
+            batch = next(data_iterator)
+            # Batch from Dataloader is a list of tensors: [input_ids]
+            input_ids = batch[0]
+            target_ids = input_ids.clone()
+            
+            # Forward pass (无 labels，避免 transformers 内部计算爆显存)
+            outputs = model(input_ids)
+            ce_loss_val = chunked_cross_entropy(outputs.logits, target_ids)
+            lm_loss = ce_loss_val
+            
+            # 手动释放不必要的 graph 对象
+            if hasattr(outputs, "hidden_states"):
+                del outputs.hidden_states
 
-            # alpha 调度
-            # alpha = alpha_scheduler.step(step)
-            effective_sparse_reg = args.sparse_reg * alpha
-
-            # ── 前向 ─────────────────────────────────────────────────────────
-            outputs = model(input_ids, labels=labels)
-            lm_loss = outputs.loss
-
-            # ── KL 蒸馏损失（若提供教师模型）────────────────────────────────
-            ce_loss_val = lm_loss.item()   # 记录纯 CE loss，供日志使用
-            kl_loss_val = 0.0
-            if teacher_model is not None and args.distill_lambda > 0:
-                # 1. 把输入数据送到教师模型所在的卡 (cuda:1 = 物理卡3)
-                input_ids_teacher = input_ids.to("cuda:1")
-
+            # Optional KL Distillation with Teacher
+            kl_loss_val = torch.tensor(0.0, device=device)
+            if teacher_model is not None:
                 with torch.no_grad():
-                    # 2. 教师模型在 cuda:1 前向传播
-                    teacher_out = teacher_model(input_ids_teacher)
+                    teacher_outputs = teacher_model(input_ids)
+                s_logits = outputs.logits
+                t_logits = teacher_outputs.logits
+                kl_val = kl_distill_loss(s_logits, t_logits, temperature=args.distill_temp)
+                lm_loss = (1.0 - args.distill_lambda) * ce_loss_val + args.distill_lambda * kl_val
+                kl_loss_val = kl_val
+                # 尽早释放大张量
+                del teacher_outputs, s_logits, t_logits
 
-                # 3. 把教师的 logits 拉回到学生模型所在的卡 (cuda:0)
-                # 关键优化：立即转移到CPU，避免在GPU上保留完整logits
-                teacher_logits = teacher_out.logits.cpu()
+            # Optional Sparsity Regularization
+            loss = lm_loss
+            sparse_penalty_val = torch.tensor(0.0, device=device)
+            if args.sparse_reg > 0 and alpha > 0.1:
+                sparse_penalty = 0.0
+                unwrapped = accelerator.unwrap_model(model)
+                for mod in unwrapped.modules():
+                    if isinstance(mod, LlamaMLPReluTransition) and hasattr(mod, "last_h"):
+                        sparse_penalty += sparse24_activation_penalty(mod.last_h)
+                loss = lm_loss + args.sparse_reg * sparse_penalty
+                sparse_penalty_val = sparse_penalty
 
-                # 4. 释放教师模型的显存
-                del teacher_out, input_ids_teacher
+            # Backward pass (Accelerate handles the scaling under the hood)
+            accelerator.backward(loss)
 
-                # 5. 计算 KL 散度（teacher_logits在CPU，会按需传输）
-                kl_loss = kl_distill_loss(
-                    outputs.logits, teacher_logits.to(outputs.logits.device),
-                    temperature=args.distill_temp,
-                    chunk_size=128  # 更小的chunk size
-                )
+            # Gradient clipping (should be synced)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+            
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
-                # 显式清理显存
-                del teacher_logits
+        # Gather metrics across devices if we just stepped
+        if accelerator.sync_gradients:
+            step += 1
+            
+            # Advance Alpha
+            unwrapped = accelerator.unwrap_model(model)
+            alpha = alpha_scheduler.step(step)
 
-                # # 动态蒸馏权重：如果随 alpha 降低到 0，会导致在 alpha=1 (纯 ReLU) 最不稳定时丧失教师引导，发生崩溃。
-                # # 应该保持固定的蒸馏权重来规制强行替换导致的分布急剧偏移。
-                effective_distill_lambda = args.distill_lambda
+            # Store metrics for logging
+            log_loss += loss.detach().float()
+            log_ce += ce_loss_val.detach().float()
+            log_kl += kl_loss_val.detach().float()
+            if args.monitor_sparsity:
+                log_h_sparse += sparsity_monitor.mean_sparsity() 
+            
+            if step % args.log_interval == 0:
+                # Reduce over DDP
+                metrics = torch.tensor([log_loss, log_ce, log_kl], device=device)
+                metrics = accelerator.reduce(metrics, reduction="mean") / args.log_interval
                 
-                lm_loss = (1.0 - effective_distill_lambda) * lm_loss + effective_distill_lambda * kl_loss
-                kl_loss_val = kl_loss.item()
+                avg_loss, avg_ce, avg_kl = metrics[0].item(), metrics[1].item(), metrics[2].item()
+                sparsity = (log_h_sparse / args.log_interval) if args.monitor_sparsity else 0.0
 
-            #新增
-            sparse_penalty_val = 0.0
-            if effective_sparse_reg > 0 and alpha > 0.1:
-                relu_mlps = get_all_relu_mlps(model)
-                h_list = [m.last_h for m in relu_mlps if hasattr(m, 'last_h') and m.last_h is not None]
-                if h_list:
-                    sparse_penalty = torch.stack(
-                        [sparse24_activation_penalty(h) for h in h_list]
-                    ).mean()
-                    loss = lm_loss + effective_sparse_reg * sparse_penalty
-                    sparse_penalty_val = sparse_penalty.item()
-                else:
-                    loss = lm_loss
-                # 注意：不清除 last_h，让 SparsityMonitor 可以读取
-                # last_h 会在下一次 forward 时自然被覆盖
-            else:
-                loss = lm_loss
+                pbar.update(args.log_interval)
+                pbar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "ce":   f"{avg_ce:.4f}",
+                    "kl":   f"{avg_kl:.4f}",
+                    "α":    f"{alpha:.3f}",
+                    "zeros": f"{sparsity:.2%}",
+                })
 
-            # ── 反向传播（累积梯度）─────────────────────────────────────────
-            # 除以累积步数，确保梯度尺度正确
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+                log_loss, log_ce, log_kl, log_h_sparse = 0.0, 0.0, 0.0, 0.0
 
-            # 只在累积循环的最后一步记录loss（每个optimizer step记录一次）
-            if accumulation_step == args.gradient_accumulation_steps - 1:
-                total_loss += loss.item() * args.gradient_accumulation_steps
-                total_lm_loss += lm_loss.item()
-                total_ce_loss += ce_loss_val
-                total_kl_loss += kl_loss_val
-                total_sparse_loss += sparse_penalty_val
+            # ── Checkpoint Saving ──────────────────────────────────────
+            if step % args.save_interval == 0:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+                    print(f"\n[step {step:5d}] 保存 checkpoint 到 {ckpt_dir} ...")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    try:
+                        accelerator.save_state(ckpt_dir)
+                        # 保存额外的 custom 状态
+                        with open(os.path.join(ckpt_dir, "custom_state.json"), "w") as f:
+                            json.dump({"step": step, "alpha": float(alpha)}, f)
+                        # 同时保存标准的 HF weight 以便之后直接使用 from_pretrained 加载
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        unwrapped_model.save_pretrained(os.path.join(ckpt_dir, "hf_model"), safe_serialization=False)
+                        tokenizer.save_pretrained(os.path.join(ckpt_dir, "hf_model"))
+                        print("  Checkpoint 保存成功。")
+                    except Exception as e:
+                        print(f"  [警告] Checkpoint 保存失败: {e}")
 
-        # ── 参数更新（累积完成后）─────────────────────────────────────────
-        nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_norm=1.0
-        )
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-
-        # for m in get_all_relu_mlps(model):
-        #     m.last_h = None
-
-        step += 1
-        pbar.update(1)
-
-        # ── 日志 ─────────────────────────────────────────────────────────
-        if step % args.log_interval == 0:
-            avg_loss   = total_loss      / args.log_interval
-            avg_lm     = total_lm_loss   / args.log_interval
-            avg_ce     = total_ce_loss   / args.log_interval
-            avg_kl     = total_kl_loss   / args.log_interval
-            avg_sparse = total_sparse_loss / args.log_interval
-            sparsity   = sparsity_monitor.mean_sparsity() if args.monitor_sparsity else 0.0
-            total_loss = total_lm_loss = total_ce_loss = total_kl_loss = total_sparse_loss = 0.0
-
-            pbar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
-                "ce":   f"{avg_ce:.4f}",
-                "kl":   f"{avg_kl:.4f}",
-                "α":    f"{alpha:.3f}",
-                "zeros": f"{sparsity:.2%}",
-            })
-
-        # ── 周期性保存 checkpoint ──────────────────────────────────────────────
-        if step > 0 and step % args.save_interval == 0:
-            ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
-            print(f"\n[step {step:5d}] 保存 checkpoint 到 {ckpt_dir} ...")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            try:
-                model.save_pretrained(ckpt_dir, safe_serialization=False)
-                tokenizer.save_pretrained(ckpt_dir)
-                print("  Checkpoint 保存成功。")
-            except Exception as e:
-                print(f"  [警告] Checkpoint 保存失败: {e}")
-
-        # ── 周期性 PPL 评估 ───────────────────────────────────────────────
-        if step % args.eval_interval == 0:
-            ppl = eval_ppl(model, eval_enc)
-            effective_lambda = args.distill_lambda if teacher_model else 0.0
-            print(f"\n[step {step:5d}] PPL={ppl:.4f}  α={alpha:.3f}  "
-                  f"λ_distill={effective_lambda:.3f}  lr={lr_scheduler.get_last_lr()[0]:.2e}")
-            model.train()
+            # ── Eval Evaluation ────────────────────────────────────────
+            if getattr(args, "eval_interval", 500) > 0 and step % args.eval_interval == 0:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    ppl = eval_ppl(unwrapped_model, eval_enc)
+                    effective_lambda = args.distill_lambda if teacher_model else 0.0
+                    print(f"\n[step {step:5d}] PPL={ppl:.4f}  α={alpha:.3f}  "
+                          f"λ_distill={effective_lambda:.3f}  lr={lr_scheduler.get_last_lr()[0]:.2e}")
+                
+                    model.train() # Reset to train mode in main process
+                accelerator.wait_for_everyone()
 
     pbar.close()
 
-    # ── 关闭监控 ──────────────────────────────────────────────────────────
+    # 关闭监控
     if args.monitor_sparsity:
         sparsity_monitor.detach()
 
-    # ── 最终评估 ──────────────────────────────────────────────────────────
-    # 获取当前 alpha 值进行评估
-    final_alpha = get_all_relu_mlps(model)[0].alpha.item()
-    print(f"\n计算最终 PPL（alpha={final_alpha:.3f}）...")
-    ppl_final = eval_ppl(model, eval_enc)
-    print(f"  初始 PPL: {ppl_init:.4f}")
-    print(f"  最终 PPL: {ppl_final:.4f}  (Δ = {ppl_final - ppl_init:+.4f})")
+    # 最终评估
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        final_alpha = get_all_relu_mlps(unwrapped_model)[0].alpha.item()
+        print(f"\n计算最终 PPL（alpha={final_alpha:.3f}）...")
+        ppl_final = eval_ppl(unwrapped_model, eval_enc)
+        print(f"  最终 PPL: {ppl_final:.4f}")
 
-    # ── 激活稀疏率统计 ────────────────────────────────────────────────────
-    print("\n测量最终激活稀疏率...")
-    _monitor = ActivationSparsityMonitor()
-    _monitor.attach(model)
-    _ = eval_ppl(model, eval_enc)          # 跑一遍 eval 触发 hook
-    final_sparsity = _monitor.mean_sparsity()
-    _monitor.detach()
-    print(f"  down_proj 输入平均零值比例: {final_sparsity:.2%}")
-
-    # ── 保存 ──────────────────────────────────────────────────────────────
-    if args.output_dir:
-        print(f"\n保存模型到 {args.output_dir} ...")
-        os.makedirs(args.output_dir, exist_ok=True)
-        try:
-            model.save_pretrained(args.output_dir, safe_serialization=False)
-            tokenizer.save_pretrained(args.output_dir)
-            print("保存成功。")
-        except Exception as e:
-            print(f"[警告] 保存失败: {e}")
+        if args.output_dir:
+            print(f"\n保存最终模型到 {args.output_dir} ...")
+            os.makedirs(args.output_dir, exist_ok=True)
+            try:
+                unwrapped_model.save_pretrained(args.output_dir, safe_serialization=False)
+                tokenizer.save_pretrained(args.output_dir)
+                print("保存成功。")
+            except Exception as e:
+                print(f"[警告] 保存失败: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. 参数解析 & main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Llama 3 SwiGLU → ReLU 渐进式替换微调"
-    )
-    # 路径
+def build_args():
+    # 抽取出来复用，直接用正则中已经处理好的前面那部分
+    pass
+
+def main() -> None:
+    # ── DDP/Accelerate 初始化 ──
+    # 在最开始解析参数
+    p = argparse.ArgumentParser(description="Llama 3 SwiGLU → ReLU 多卡并跑微调")
     p.add_argument("--model_id",      type=str, default="/data/sza/model/Meta-Llama-3.1-8B")
     p.add_argument("--dataset_path",  type=str, default="/data/sza/local_dataset")
     p.add_argument("--output_dir",    type=str, default="/data/sza/model/Meta-Llama-3.1-8B-ReluSparse")
-    p.add_argument("--device",        type=str, default="cuda")
-
-    # 数据集
-    p.add_argument("--dataset_name",     type=str, default="fineweb-edu",
-                   choices=["fineweb-edu", "wikitext-103", "wikitext-2"],
-                   help="训练数据集：fineweb-edu(推荐) / wikitext-103 / wikitext-2")
-    p.add_argument("--max_train_tokens", type=int, default=1_000_000_000,
-                   help="最多加载的训练 token 数（50M ≈ 97,000 块×512）")
-
-    # KL 蒸馏
-    p.add_argument("--teacher_model_id", type=str, default="/data/sza/model/Meta-Llama-3.1-8B",
-                   help="教师模型路径（原始 SwiGLU），为 None 时禁用蒸馏")
-    p.add_argument("--distill_lambda",   type=float, default=0.5,
-                   help="KL 蒸馏损失权重：L=(1-λ)·CE + λ·KL，推荐 0.3~0.7")
-    p.add_argument("--distill_temp",     type=float, default=2.0,
-                   help="蒸馏温度 τ，>1 软化分布，推荐 2.0~4.0")
-
-    # 训练超参
-    p.add_argument("--max_steps",     type=int,   default=30000,
-                   help="总训练步数")
-    p.add_argument("--ramp_steps",    type=int,   default=15000,
-                   help="alpha 从 0→1 的步数，之后保持 alpha=1")
-    p.add_argument("--warmup_steps",  type=int,   default=3000,
-                   help="学习率 warmup 步数")
+    p.add_argument("--dataset_name",     type=str, default="fineweb-edu", choices=["fineweb-edu", "wikitext-103", "wikitext-2"])
+    p.add_argument("--max_train_tokens", type=int, default=1_000_000_000)
+    p.add_argument("--teacher_model_id", type=str, default="/data/sza/model/Meta-Llama-3.1-8B")
+    p.add_argument("--distill_lambda",   type=float, default=0.5)
+    p.add_argument("--distill_temp",     type=float, default=2.0)
+    p.add_argument("--max_steps",     type=int,   default=30000)
+    p.add_argument("--ramp_steps",    type=int,   default=15000)
+    p.add_argument("--warmup_steps",  type=int,   default=3000)
     p.add_argument("--lr",            type=float, default=5e-6)
-    p.add_argument("--batch_size",    type=int,   default=2,
-                   help="批次大小（蒸馏时建议≤2以避免OOM）")
-    p.add_argument("--gradient_accumulation_steps", type=int, default=16,
-                   help="梯度累积步数，有效batch size = batch_size × gradient_accumulation_steps")
-    p.add_argument("--seq_len",       type=int,   default=2048,
-                   help="训练时的序列长度（蒸馏时建议≤1024）")
-
-    # 稀疏正则化
-    p.add_argument("--sparse_reg",    type=float, default=0.001,
-                   help="2:4 激活稀疏正则化系数（0=禁用）")
-
-    # Calibration
-    p.add_argument("--skip_calibration", action="store_true",
-                   help="跳过校准，使用默认 relu_scale=0.5（调试用）")
-
-    # 训练范围
-    p.add_argument("--train_all_params", action="store_true",
-                   help="全参数微调（默认只训练 MLP 层）")
-
-    # 日志 & 评估
+    p.add_argument("--batch_size",    type=int,   default=2)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=8, help="单卡的累积步数")
+    p.add_argument("--seq_len",       type=int,   default=2048)
+    p.add_argument("--sparse_reg",    type=float, default=0.001)
+    p.add_argument("--skip_calibration", action="store_true")
+    p.add_argument("--train_all_params", action="store_true")
     p.add_argument("--log_interval",  type=int, default=50)
     p.add_argument("--eval_interval", type=int, default=500)
-    p.add_argument("--save_interval", type=int, default=10000, help="每 N 步保存一次 checkpoint")
-    p.add_argument("--log_file", type=str, default="train_change_relu.log", help="实时日志文件路径")
-    # p.add_argument("--monitor_sparsity", action="store_true", default=True,
-    #                help="在训练时监控激活稀疏度")
-    p.add_argument("--monitor_sparsity", action=argparse.BooleanOptionalAction,
-               default=True, help="监控激活稀疏度（--no-monitor_sparsity 可关闭）")
-    return p.parse_args()
+    p.add_argument("--save_interval", type=int, default=1000)
+    p.add_argument("--log_file", type=str, default="train_change_relu.log")
+    p.add_argument("--monitor_sparsity", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--resume_from_checkpoint", type=str, default=None, help="恢复训练的checkpoint目录，如/data/sza/.../checkpoint-1000")
+    
+    args = p.parse_args()
 
+    from accelerate import InitProcessGroupKwargs
+    from datetime import timedelta
+    # 将 DDP 同步超时时间延长到 3 小时 (10800 秒)，防止主卡加载大量数据时副卡等崩溃
+    timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=3600))
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[timeout_kwargs]
+    )
 
-import sys
-
-class Logger(object):
-    def __init__(self, filename="Default.log"):
-        self.terminal = sys.stdout
-        self.log = open(filename, "a", encoding="utf-8")
-        self.log.flush()
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-def main() -> None:
-    args = build_args()
-    sys.stdout = Logger(args.log_file)
-    sys.stderr = sys.stdout
-    print(f"\n================ 启动训练 (实时日志已配置) ================\n")
-
-    if torch.cuda.is_available():
-        print(f"检测到 {torch.cuda.device_count()} 个可用GPU:")
-        for i in range(torch.cuda.device_count()):
-            print(f"  cuda:{i} -> {torch.cuda.get_device_name(i)}")
-        print(f"环境变量 CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    if accelerator.is_main_process:
+        sys.stdout = Logger(args.log_file)
+        sys.stderr = sys.stdout
+        print(f"\n================ 启动 DDP 训练 (共 {accelerator.num_processes} 卡) ================\n")
     else:
-        print("警告：CUDA 不可用，将在 CPU 运行（极慢）")
+        sys.stdout = open(os.devnull, "w")
 
-    print(f"\n加载模型: {args.model_id}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # ── 预先加载训练数据（用于calibration和训练）───────────────────────────
-    print("\n加载训练数据（用于calibration和训练）...")
-    train_ids = load_train_data(
-        tokenizer=tokenizer,
-        seq_len=args.seq_len,
-        max_train_tokens=args.max_train_tokens,
-        dataset_path=args.dataset_path
-    )
-    print(f"  已加载 {len(train_ids)} 块训练数据")
+    if accelerator.is_main_process:
+        print("\n加载训练数据（用于calibration和训练）...")
+    
+    with accelerator.main_process_first():
+        train_ids = load_train_data(
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            max_train_tokens=args.max_train_tokens,
+            dataset_path=args.dataset_path
+        )
+        
+    if accelerator.is_main_process:
+        print(f"  已加载 {len(train_ids)} 块训练数据")
 
-    # 学生模型放在 cuda:0（物理卡1）
+    # ========= 分配模型到各卡的正确设备设备上 =========
+    # DDP 环境中，每张卡处理一个进程。我们使用 accelerator.local_process_index
+    device_map = {"": accelerator.local_process_index}
+    
+    # 保证所有的卡等主进程读完数据
+    accelerator.wait_for_everyone()
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
-        device_map="cuda:0",
+        device_map=device_map, use_cache=False,
     )
     model.gradient_checkpointing_enable()
-    print(f"\n学生模型已加载到 cuda:0 ({torch.cuda.get_device_name(0)})，已开GC")
+    
+    if accelerator.is_main_process:
+        print(f"\n学生模型已加载。已开GC")
 
     # ── 替换所有 MLP（含方差对齐校准）─────────────────────────────────────
     if args.skip_calibration:
-        print("  [跳过 Calibration] 使用默认 relu_scale=0.5")
+        if accelerator.is_main_process:
+            print("  [跳过 Calibration] 使用默认 relu_scale=0.5")
         replaced = replace_all_mlp(model, alpha=0.0, calib_ids=None)
     else:
-        print("  Calibration: 从训练数据中随机抽取样本...")
-        # 随机抽取64条真实训练数据进行calibration
-        calib_indices = torch.randint(0, len(train_ids), (64,))
-        _calib_ids = train_ids[calib_indices].to("cuda:0")
-        print(f"    抽取了 {len(_calib_ids)} 条真实训练样本 (indices: {calib_indices.tolist()})")
+        if accelerator.is_main_process:
+            print("  Calibration: 从训练数据中随机抽取样本...")
+        # 取16个真实样本 (单卡算一下就好或者都在自己卡上算)
+        calib_indices = torch.randint(0, len(train_ids), (16,))
+        calib_ids = train_ids[calib_indices].to(accelerator.device)
+        replaced = replace_all_mlp(model, alpha=0.0, calib_ids=calib_ids)
 
-        replaced = replace_all_mlp(model, alpha=0.0, calib_ids=_calib_ids)
-        del _calib_ids  # 在这里删除，确保变量存在时才删除
+    if accelerator.is_main_process:
+        print(f"  已替换 {replaced} 个 MLP 层为 LlamaMLPReluTransition")
 
-    print(f"  已替换 {replaced} 个 MLP 层为 LlamaMLPReluTransition（初始 alpha=0，纯 SwiGLU）")
-
-    # ── 关键验证：alpha=0 时模型输出应与原始模型一致 ─────────────────────────
-    print("\n[验证] 检查 alpha=0 时的模型输出...")
+    # ── 关键验证 ──────────────────────────────────────────────────────────
+    if accelerator.is_main_process:
+        print("\n[验证] 检查 alpha=0 时的模型输出...")
     model.eval()
     with torch.no_grad():
-        test_ids = train_ids[:2].to("cuda:0")
-        outputs = model(test_ids, labels=test_ids)
-        initial_loss = outputs.loss.item()
+        test_ids = train_ids[:1].to(accelerator.device)
+        out = model(test_ids, labels=test_ids)
+        if accelerator.is_main_process:
+            print(f"  初始 Loss (alpha=0): {out.loss.item():.4f}")
 
-    print(f"  初始 Loss (alpha=0): {initial_loss:.4f}")
-    if initial_loss > 5.0:
-        print("  ⚠️ 警告：初始 Loss 异常高！模型可能存在问题。")
-        print("  正常的初始 Loss 应该在 2.0-4.0 之间。")
-    else:
-        print("  ✅ 初始 Loss 正常，模型替换成功！")
-    model.train()
-
-    # ── 加载教师模型（可选，用于 KL 蒸馏）──────────────────────────────────
+    # ── 加载教师模型 ───────────────────────────────────────────────────────
     teacher_model = None
     if args.teacher_model_id is not None:
-        print(f"\n加载全精度教师模型 (bfloat16): {args.teacher_model_id}")
-        # CUDA_VISIBLE_DEVICES="1,3" 后，cuda:0=物理卡1, cuda:1=物理卡3
+        if accelerator.is_main_process:
+            print(f"\n加载教师模型: {args.teacher_model_id}")
         teacher_model = AutoModelForCausalLM.from_pretrained(
             args.teacher_model_id,
             torch_dtype=torch.bfloat16,
-            device_map="cuda:1"  # 映射到物理卡3（第二张可见卡）
+            device_map=device_map, use_cache=False,
         )
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad_(False)
-        print(f"  教师模型加载到cuda:1 ({torch.cuda.get_device_name(1)}), 蒸馏权重 λ={args.distill_lambda}, τ={args.distill_temp}")
 
     # ── 开始训练 ────────────────────────────────────────────────────────────
-    train(args, model, tokenizer, teacher_model=teacher_model, train_ids=train_ids)
-
+    train(args, model, tokenizer, teacher_model=teacher_model, train_ids=train_ids, accelerator=accelerator)
 
 if __name__ == "__main__":
     main()
