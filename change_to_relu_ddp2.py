@@ -89,28 +89,29 @@ class LlamaMLPReluTransition(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.zeros(down_proj.out_features, device=down_proj.weight.device, dtype=down_proj.weight.dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(x)   # [B, T, intermediate_size]
-        up   = self.up_proj(x)     # [B, T, intermediate_size]
+        gate = self.gate_proj(x)
+        up   = self.up_proj(x)
 
-        # 确保 alpha 和 relu_scale 与 gate 的 dtype 一致
         alpha = self.alpha.to(gate.dtype)
         relu_scale = self.relu_scale.to(gate.dtype)
 
-        # SwiGLU 路径（alpha=0 时退化为原始 Llama 3）
-        swiglu = F.silu(gate)          # 平滑激活，无自然零点
-
-        # ReLU 路径（alpha=1 时：gate ≤ 0 → 精确 0，天然稀疏）
-        # relu_scale 将 relu 的方差对齐到 silu，防止 alpha 增大时激活幅度爆炸
+        swiglu = F.silu(gate)
         relu_act = F.relu(gate) * relu_scale
-
-        # 线性混合，grad 对两条路径均可通过
         mixed = alpha * relu_act + (1.0 - alpha) * swiglu
 
-        h = mixed * up  # down_proj 的输入，随 alpha→1 越来越稀疏
-        self.last_h = h
+        h = mixed * up
 
-        # 核心修复：把均值便宜补偿加载到 down_proj 输出上
-        # 不影响 h 的稀疏度，又抵消了残差流里的 Mean Shift
+        if self.training:
+            with torch.no_grad():
+                self._sparsity_frac = (h.abs() < 1e-6).float().mean().item()
+            # 仅在训练循环需要稀疏惩罚时应用挂载，且避免 checkpointing 内存泄漏
+            coeff = getattr(self, '_penalty_coeff', 0.0)
+            if coeff > 0.0:
+                h = Sparse24PenaltyFunction.apply(h, coeff)
+            self.last_h = None  # 防止之前逻辑可能意外调用的情况，安全起见置为 None
+        else:
+            self.last_h = None
+
         out = self.down_proj(h)
         out = out + alpha * self.down_proj_bias
         return out
@@ -357,11 +358,8 @@ class ActivationSparsityMonitor:
     #         zero_frac = (h.abs() < 1e-6).float().mean().item()
     #         self.sparsity_records.append(zero_frac)
     def _hook(self, module, inputs, output):
-        with torch.no_grad():
-            if hasattr(module, 'last_h') and module.last_h is not None:
-                h = module.last_h
-                zero_frac = (h.abs() < 1e-6).float().mean().item()
-                self.sparsity_records.append(zero_frac)
+        if hasattr(module, '_sparsity_frac'):
+            self.sparsity_records.append(module._sparsity_frac)
 
     def mean_sparsity(self) -> float:
         if not self.sparsity_records:
@@ -543,9 +541,13 @@ class AlphaScheduler:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def infinite_dataloader(dataloader):
+    epoch = 0
     while True:
+        if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
         for batch in dataloader:
             yield batch
+        epoch += 1
 
 def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] = None,
           train_ids: Optional[torch.Tensor] = None, accelerator=None) -> None:
@@ -584,9 +586,9 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
     # DDP 环境下，accelerator.prepare(dataloader) 会自动插入 DistributedSampler
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
+    eval_enc = None
     if accelerator.is_main_process:
         print("加载验证集...")
-    with accelerator.main_process_first():
         eval_enc = load_eval_data(args.dataset_path, tokenizer, device=device)
 
     # ── 优化器 & 调度 ────────────────────────────────────────────────────────
@@ -627,18 +629,26 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
         if os.path.exists(args.resume_from_checkpoint):
             if accelerator.is_main_process:
                 print(f"\n正在从 {args.resume_from_checkpoint} 恢复训练...")
+            # 兼容旧 checkpoint：补齐缺失的非 rank-0 random_states 文件
+            rank0_rng = os.path.join(args.resume_from_checkpoint, "random_states_0.pkl")
+            if os.path.exists(rank0_rng):
+                import shutil
+                for ri in range(accelerator.num_processes):
+                    target_rng = os.path.join(
+                        args.resume_from_checkpoint, f"random_states_{ri}.pkl")
+                    if not os.path.exists(target_rng):
+                        shutil.copy2(rank0_rng, target_rng)
+                        if accelerator.is_main_process:
+                            print(f"  [兼容] 复制 random_states_0 -> random_states_{ri}")
             accelerator.load_state(args.resume_from_checkpoint)
-            # 加载 step，并恢复 alpha_scheduler
             state_file = os.path.join(args.resume_from_checkpoint, "custom_state.json")
             if os.path.exists(state_file):
                 with open(state_file, "r") as f:
                     state = json.load(f)
                     step = state.get("step", 0)
-            
-            # 手动推进 alpha
-            for _ in range(step):
-                alpha_scheduler.step(_ + 1)
-                
+
+            alpha_scheduler.step(step)
+
             if accelerator.is_main_process:
                 print(f"成功恢复到第 {step} 步，开始接续训练。")
         else:
@@ -678,8 +688,15 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
     pbar = tqdm(total=args.max_steps, desc="ReLU-ification 微调 (DDP)", disable=not accelerator.is_main_process, initial=step)
     alpha = alpha_scheduler.step(step)
 
-    # Variables for logging
+    def _set_penalty_coeff(coeff):
+        for mod in accelerator.unwrap_model(model).modules():
+            if isinstance(mod, LlamaMLPReluTransition):
+                mod._penalty_coeff = coeff
+                mod.last_h = None  # clean up legacy just in case
+
+    _set_penalty_coeff(args.sparse_reg if (args.sparse_reg > 0 and alpha > 0.1) else 0.0)
     log_loss, log_ce, log_kl, log_h_sparse = 0.0, 0.0, 0.0, 0.0
+    _micro_loss, _micro_ce, _micro_kl = 0.0, 0.0, 0.0
 
     while step < args.max_steps:
         # Accelerate handles gradient accumulation context automatically
@@ -711,19 +728,10 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
                 # 尽早释放大张量
                 del teacher_outputs, s_logits, t_logits
 
-            # Optional Sparsity Regularization
             loss = lm_loss
-            sparse_penalty_val = torch.tensor(0.0, device=device)
-            if args.sparse_reg > 0 and alpha > 0.1:
-                sparse_penalty = 0.0
-                unwrapped = accelerator.unwrap_model(model)
-                for mod in unwrapped.modules():
-                    if isinstance(mod, LlamaMLPReluTransition) and hasattr(mod, "last_h"):
-                        sparse_penalty += sparse24_activation_penalty(mod.last_h)
-                loss = lm_loss + args.sparse_reg * sparse_penalty
-                sparse_penalty_val = sparse_penalty
+            # 注：稀疏惩罚已经在模型前向传播时通过 AddSparsePenaltyWrap 自动处理并融合到了梯度中
+            # 此处不再需要手动获取 layer 的 last_h 以及计算外层 graph 惩罚
 
-            # Backward pass (Accelerate handles the scaling under the hood)
             accelerator.backward(loss)
 
             # Gradient clipping (should be synced)
@@ -734,30 +742,32 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
             lr_scheduler.step()
             optimizer.zero_grad()
 
-        # Gather metrics across devices if we just stepped
+            _micro_loss += loss.detach().float().item()
+            _micro_ce += ce_loss_val.detach().float().item()
+            _micro_kl += kl_loss_val.detach().float().item()
+
         if accelerator.sync_gradients:
             step += 1
-            
-            # Advance Alpha
-            unwrapped = accelerator.unwrap_model(model)
-            alpha = alpha_scheduler.step(step)
+            pbar.update(1)
 
-            # Store metrics for logging
-            log_loss += loss.detach().float()
-            log_ce += ce_loss_val.detach().float()
-            log_kl += kl_loss_val.detach().float()
+            alpha = alpha_scheduler.step(step)
+            _set_penalty_coeff(args.sparse_reg if (args.sparse_reg > 0 and alpha > 0.1) else 0.0)
+
+            n_micro = args.gradient_accumulation_steps
+            log_loss += _micro_loss / n_micro
+            log_ce += _micro_ce / n_micro
+            log_kl += _micro_kl / n_micro
+            _micro_loss, _micro_ce, _micro_kl = 0.0, 0.0, 0.0
             if args.monitor_sparsity:
-                log_h_sparse += sparsity_monitor.mean_sparsity() 
-            
+                log_h_sparse += sparsity_monitor.mean_sparsity()
+
             if step % args.log_interval == 0:
-                # Reduce over DDP
                 metrics = torch.tensor([log_loss, log_ce, log_kl], device=device)
                 metrics = accelerator.reduce(metrics, reduction="mean") / args.log_interval
-                
+
                 avg_loss, avg_ce, avg_kl = metrics[0].item(), metrics[1].item(), metrics[2].item()
                 sparsity = (log_h_sparse / args.log_interval) if args.monitor_sparsity else 0.0
 
-                pbar.update(args.log_interval)
                 pbar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
                     "ce":   f"{avg_ce:.4f}",
@@ -768,21 +778,20 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
 
                 log_loss, log_ce, log_kl, log_h_sparse = 0.0, 0.0, 0.0, 0.0
 
-            # ── Checkpoint Saving ──────────────────────────────────────
             if step % args.save_interval == 0:
+                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                # save_state 必须所有进程共同调用，各 rank 保存各自的 random_states
+                accelerator.save_state(ckpt_dir)
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
-                    ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
                     print(f"\n[step {step:5d}] 保存 checkpoint 到 {ckpt_dir} ...")
-                    os.makedirs(ckpt_dir, exist_ok=True)
                     try:
-                        accelerator.save_state(ckpt_dir)
-                        # 保存额外的 custom 状态
                         with open(os.path.join(ckpt_dir, "custom_state.json"), "w") as f:
                             json.dump({"step": step, "alpha": float(alpha)}, f)
-                        # 同时保存标准的 HF weight 以便之后直接使用 from_pretrained 加载
                         unwrapped_model = accelerator.unwrap_model(model)
-                        unwrapped_model.save_pretrained(os.path.join(ckpt_dir, "hf_model"), safe_serialization=False)
+                        unwrapped_model.save_pretrained(
+                            os.path.join(ckpt_dir, "hf_model"), safe_serialization=False)
                         tokenizer.save_pretrained(os.path.join(ckpt_dir, "hf_model"))
                         print("  Checkpoint 保存成功。")
                     except Exception as e:
@@ -914,7 +923,9 @@ def main() -> None:
         torch_dtype=torch.bfloat16,
         device_map=device_map, use_cache=False,
     )
-    model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     if accelerator.is_main_process:
         print(f"\n学生模型已加载。已开GC")

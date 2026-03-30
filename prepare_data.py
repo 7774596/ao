@@ -119,7 +119,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default="/data/sza/local_dataset")
     parser.add_argument("--max_train_tokens", type=int, default=4_000_000_000)
     parser.add_argument("--seq_len", type=int, default=2048)
-    parser.add_argument("--output_file", type=str, default="train_data_4B.pt")
+    parser.add_argument("--output_file", type=str, default="/data/sza/local_dataset/train_data_4B.pt")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
