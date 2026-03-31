@@ -320,6 +320,35 @@ def sparse24_activation_penalty(h: torch.Tensor) -> torch.Tensor:
     return penalty
 
 
+class Sparse24PenaltyFunction(torch.autograd.Function):
+    """
+    前向恒等返回 h；反向时在 grad_output 上叠加 coeff * ∂(sparse24_activation_penalty)/∂h，
+    等价于总损失里增加 coeff * penalty(h)，但不把 penalty 标量并入 loss 张量（与训练循环注释一致）。
+    """
+
+    @staticmethod
+    def forward(ctx, h: torch.Tensor, coeff: float) -> torch.Tensor:
+        ctx.coeff = float(coeff)
+        ctx.save_for_backward(h)
+        return h
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        h, = ctx.saved_tensors
+        coeff = ctx.coeff
+        # autograd.Function.backward 默认在 no_grad 下执行，需显式 enable 才能对 penalty 再求导
+        with torch.enable_grad():
+            h_det = h.detach().requires_grad_(True)
+            pen = sparse24_activation_penalty(h_det)
+            grad_pen, = torch.autograd.grad(
+                pen,
+                h_det,
+                retain_graph=False,
+                create_graph=False,
+            )
+        return grad_output + coeff * grad_pen, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. 激活稀疏度监控钩子
 # ─────────────────────────────────────────────────────────────────────────────
