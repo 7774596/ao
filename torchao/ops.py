@@ -32,6 +32,9 @@ lib.define(
     "sparse24_sm90_sparsify(Tensor input, str metadata_fmt, str activation, str sp_selection_algo, *, ScalarType? dtype = None, Tensor? scale=None) -> (Tensor, Tensor)"
 )
 lib.define(
+    "rowwise_abs_max_fp32_scale(Tensor input_2d, Tensor inv_max_scalar) -> Tensor"
+)
+lib.define(
     "sparse24_fp8_sm90_cutlass_gemm(Tensor a, Tensor a_mdata, Tensor b, *, Tensor? a_scale = None, Tensor? b_scale = None, int swizzle_size=8, str swizzle_axis='n', int sm_count=128) -> Tensor"
 )
 lib.define(
@@ -497,6 +500,22 @@ def _(
             dtype=torch.uint8,
             device=input_tensor.device,
         ),
+    )
+
+
+def rowwise_abs_max_fp32_scale(input_2d: Tensor, inv_max_scalar: Tensor) -> Tensor:
+    """Fused row-wise ``abs`` + ``amax`` + ``* inv_max`` (FP32), CUDA only when built."""
+    return torch.ops.torchao.rowwise_abs_max_fp32_scale.default(
+        input_2d, inv_max_scalar
+    )
+
+
+@register_custom_op("torchao::rowwise_abs_max_fp32_scale")
+def _(input_2d: Tensor, inv_max_scalar: Tensor) -> Tensor:
+    return torch.empty(
+        (input_2d.shape[0], 1),
+        dtype=torch.float32,
+        device=input_2d.device,
     )
 
 

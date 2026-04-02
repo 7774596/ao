@@ -11,7 +11,10 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from torchao.ops import rowwise_scaled_linear_sparse_cutlass_f8f8
+from torchao.ops import (
+    rowwise_abs_max_fp32_scale,
+    rowwise_scaled_linear_sparse_cutlass_f8f8,
+)
 from torchao.quantization import (
     Float8DynamicActivationFloat8WeightConfig,
     PerRow,
@@ -22,17 +25,19 @@ from torchao.quantization.quant_api import _float8_cutlass_quant
 
 class FP8IdentitySemiSparseActivationLinear(nn.Module):
     """
-    Runtime activation 2:4 sparsity + FP8 activation/weight Linear.
-    Designed for Llama3 MLP down_proj where SiLU-gated activation already happened upstream.
+    Runtime activation 2:4 sparsity + FP8 activation/weight Linear (Llama3 MLP down_proj).
 
-    Uses the same kernel pair as torchao/prototype/sparsity/activation/srelu_linear.py:
-      sparse24_sm90_sparsify  (activation sparsify)
-      + rowwise_scaled_linear_sparse_cutlass_f8f8  (sparse-activation GEMM)
-    These two are designed to work together and share the same metadata format.
+    Performance-oriented eval stack (see discussion in repo / five optimizations):
+    (1) Fused CUDA row abs-max scale via ``rowwise_abs_max_fp32_scale`` when available.
+    (2) Eliminating ``.t().contiguous()`` needs CUTLASS ``LayoutTagD`` / epilogue work in
+        ``rowwise_scaled_linear_sparse_cutlass.cuh`` (not done here); call order must stay
+        dense ``Xq`` first, sparse ``Wq`` third per ``check_inputs`` in that file.
+    (3) Sparsify occupancy: ``MetadataCutlass8bits::kNumWarpsPerCTA`` in ``sparsify24.cu``.
+    (4) GEMM tile heuristic: ``m <= 2048`` branch in ``select_config`` (same .cuh).
+    (5) Eval loop: ``torch.full_like`` labels + ``torch.inference_mode`` in ``wiki2_eval``.
 
-    NOTE: rowwise_scaled_linear_sparse_cutlass_f8f8 treats the ACTIVATION as the
-    "weight" arg (sparse side) and the dense weight as the "input" arg, computing
-    W @ X^T -> [N, M], then .t().contiguous() -> [M, N].
+    ``torch.compile`` on the full model remains optional via ``--compile`` (custom ops
+    stay opaque to Inductor across sparsify/GEMM boundaries).
     """
 
     def __init__(
@@ -40,15 +45,16 @@ class FP8IdentitySemiSparseActivationLinear(nn.Module):
         weight: torch.Tensor,
         activation_dtype: torch.dtype = torch.float8_e4m3fn,
         weight_dtype: torch.dtype = torch.float8_e4m3fn,
+        *,
+        use_fused_row_absmax: bool = True,
     ) -> None:
         super().__init__()
         self.activation_dtype = activation_dtype
+        self.use_fused_row_absmax = use_fused_row_absmax
 
         w_aqt = _float8_cutlass_quant(weight, weight_dtype)
-        self.wq = w_aqt.tensor_impl.float8_data           # [N, K]
-        # rowwise_scaled_linear_sparse_cutlass_f8f8 requires input_scale 1D [N]
+        self.wq = w_aqt.tensor_impl.float8_data  # [N, K]
         self.w_scale = w_aqt.tensor_impl.scale.squeeze(-1)  # [N]
-        # Precompute 1 / fp8_max once (avoids finfo + Python scalar div every forward).
         inv_max = 1.0 / torch.finfo(activation_dtype).max
         self.register_buffer(
             "_fp8_inv_max",
@@ -59,46 +65,63 @@ class FP8IdentitySemiSparseActivationLinear(nn.Module):
         orig_shape = x.shape
         x_2d = x.view(-1, orig_shape[-1])  # [M, K]
 
-        # Step 1: Pre-compute per-row quantization scale.
-        # sparse24_sm90_sparsify reads scale as INPUT to divide the data before
-        # FP8 cast (it does NOT compute the scale). We must provide a valid scale
-        # so that x / x_scale fits within the FP8 range without clipping.
-        x_scale_2d = x_2d.abs().amax(dim=1, keepdim=True).float().mul_(self._fp8_inv_max)
+        if (
+            self.use_fused_row_absmax
+            and x_2d.is_cuda
+            and x_2d.dtype == torch.bfloat16
+        ):
+            try:
+                x_scale_2d = rowwise_abs_max_fp32_scale(x_2d, self._fp8_inv_max)
+            except (RuntimeError, NotImplementedError):
+                x_scale_2d = (
+                    x_2d.abs()
+                    .amax(dim=1, keepdim=True)
+                    .float()
+                    .mul_(self._fp8_inv_max)
+                )
+        else:
+            x_scale_2d = (
+                x_2d.abs()
+                .amax(dim=1, keepdim=True)
+                .float()
+                .mul_(self._fp8_inv_max)
+            )
 
-        # Step 2: Fused top-2/4 sparsification + per-row FP8 quantization.
-        # sparse24_sm90_sparsify is the paired upstream kernel for
-        # rowwise_scaled_linear_sparse_cutlass_f8f8 (they share the same metadata format).
         xq_sparse, x_meta = torch.ops.torchao.sparse24_sm90_sparsify(
             x_2d,
             "cutlass",
-            "identity",  # keep largest-2 of each group-of-4, no extra activation fn
+            "identity",
             "largest_abs",
             dtype=self.activation_dtype,
-            scale=x_scale_2d,  # INPUT: kernel computes x_2d / x_scale_2d → FP8
+            scale=x_scale_2d,
         )
 
-        # Step 3: rowwise_scaled_linear_sparse_cutlass_f8f8(Wq[N,K], Xq_sparse[M,K])
-        #   computes  Wq @ Xq^T  -> [N, M],  then .t() -> [M, N]
-        #   Xq_scale (weight_scale in the API) must be 1D [M].
+        # C++ names: Xq = dense operand (full K), Wq = sparse (K/2); matches tests and
+        # rowwise_scaled_linear_sparse_cutlass.cuh::check_inputs.
         out_2d = rowwise_scaled_linear_sparse_cutlass_f8f8(
-            self.wq,           # input:        [N, K] dense FP8
-            self.w_scale,      # input_scale:  [N] 1D
-            xq_sparse,         # weight:       [M, K/2] sparse FP8
-            x_meta,            # weight_meta
-            x_scale_2d.view(-1),  # weight_scale: [M] 1D (kernel requires 1D)
+            self.wq,
+            self.w_scale,
+            xq_sparse,
+            x_meta,
+            x_scale_2d.view(-1),
             bias=None,
             out_dtype=torch.bfloat16,
-        ).t().contiguous()  # [N, M] -> [M, N], contiguous to allow view
+        ).t().contiguous()
 
         return out_2d.view(*orig_shape[:-1], out_2d.shape[-1])
 
     @classmethod
-    def from_dense(cls, linear: nn.Linear):
+    def from_dense(
+        cls,
+        linear: nn.Linear,
+        *,
+        use_fused_row_absmax: bool = True,
+    ):
         if linear.bias is not None:
             raise NotImplementedError("bias is not supported")
         if linear.weight.dtype != torch.bfloat16:
             raise NotImplementedError("weight dtype must be bf16")
-        return cls(linear.weight.data)
+        return cls(linear.weight.data, use_fused_row_absmax=use_fused_row_absmax)
 
 
 def _set_module_by_fqn(root_module: nn.Module, fqn: str, new_module: nn.Module) -> None:
@@ -109,7 +132,11 @@ def _set_module_by_fqn(root_module: nn.Module, fqn: str, new_module: nn.Module) 
     setattr(parent, parts[-1], new_module)
 
 
-def replace_llama_mlp_down_proj_with_activation_sparse(model: nn.Module) -> int:
+def replace_llama_mlp_down_proj_with_activation_sparse(
+    model: nn.Module,
+    *,
+    use_fused_row_absmax: bool = True,
+) -> int:
     target_fqns = [
         fqn
         for fqn, module in model.named_modules()
@@ -122,7 +149,10 @@ def replace_llama_mlp_down_proj_with_activation_sparse(model: nn.Module) -> int:
         _set_module_by_fqn(
             model,
             fqn,
-            FP8IdentitySemiSparseActivationLinear.from_dense(linear),
+            FP8IdentitySemiSparseActivationLinear.from_dense(
+                linear,
+                use_fused_row_absmax=use_fused_row_absmax,
+            ),
         )
     return len(target_fqns)
 
@@ -225,6 +255,11 @@ def build_args():
         action="store_true",
         help="Use torch.compile for inference",
     )
+    parser.add_argument(
+        "--no-fused-row-absmax",
+        action="store_true",
+        help="Disable CUDA fused row abs-max scale (use PyTorch abs+amax instead)",
+    )
     return parser.parse_args()
 
 
@@ -278,7 +313,10 @@ def main():
         device_map=device,
     )
 
-    replaced = replace_llama_mlp_down_proj_with_activation_sparse(model)
+    replaced = replace_llama_mlp_down_proj_with_activation_sparse(
+        model,
+        use_fused_row_absmax=not args.no_fused_row_absmax,
+    )
     print(f"Replaced {replaced} MLP down_proj layers with activation 2:4 sparse FP8 kernels")
 
     print(

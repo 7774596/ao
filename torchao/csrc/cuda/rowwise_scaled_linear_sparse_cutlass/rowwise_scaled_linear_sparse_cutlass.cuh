@@ -270,6 +270,14 @@ static void select_config(
           DtypeXq, DtypeWq, Types..., TileShape, ClusterShape>(
             Xq, X_scale, Wq, W_meta, W_scale, bias, Y);
         return;
+      } else if (m <= 2048) {
+        // Llama-class token dim (~2k seq, batch 1): try cluster along M mode.
+        using TileShape = cute::Shape<cute::_128, cute::_128, cute::_256>;
+        using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+        rowwise_scaled_linear_sparse_kernel_cutlass_sm9x<
+          DtypeXq, DtypeWq, Types..., TileShape, ClusterShape>(
+            Xq, X_scale, Wq, W_meta, W_scale, bias, Y);
+        return;
       } else {
         using TileShape = cute::Shape<cute::_128, cute::_128, cute::_256>;
         using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;

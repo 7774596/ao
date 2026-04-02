@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "=== 开始微调 ==="
-CUDA_VISIBLE_DEVICES="0,1,3,4" accelerate launch \
+CUDA_VISIBLE_DEVICES="0,1" accelerate launch \
     --multi_gpu \
     --num_processes=4 \
     --mixed_precision=bf16 \
@@ -20,7 +20,7 @@ CUDA_VISIBLE_DEVICES="0,1,3,4" accelerate launch \
     --log_interval 500 \
     --output_dir "/data/sza/model/Meta-Llama-3.1-8B-ReluSparse-Test" \
     --log_file "train_change_relu.log" \
-    --resume_from_checkpoint "/data/sza/model/Meta-Llama-3.1-8B-ReluSparse-Test/checkpoint-7000"
+    --resume_from_checkpoint "/data/sza/model/Meta-Llama-3.1-8B-ReluSparse-Test/checkpoint-11000"
 
 if [ $? -ne 0 ]; then
     echo "验证失败！请检查错误。"

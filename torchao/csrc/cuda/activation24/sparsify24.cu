@@ -127,7 +127,9 @@ __global__ void sparse24_sm90_cutlass8bits_sparsify_kernel(P p);
 struct MetadataCutlass8bits {
   static constexpr int64_t kBlockSize0 = 32;
   static constexpr int64_t kBlockSize1 = 128;
-  static constexpr int64_t kNumWarpsPerCTA = 2;
+  // 4 warps / CTA: more row parallelism within the 32×128 tile (occupancy vs
+  // regs — validate with Nsight Compute for your workload).
+  static constexpr int64_t kNumWarpsPerCTA = 4;
   static constexpr int64_t kThreadsPerCTA = kNumWarpsPerCTA * 32;
 
   template <typename ElementOut>
