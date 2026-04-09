@@ -38,7 +38,7 @@ from torchao.prototype.moe_training.ep import (
 )
 from torchao.prototype.moe_training.ep.permute import _permute_bf16
 from torchao.prototype.moe_training.ep.unpermute import _unpermute_bf16
-from torchao.prototype.moe_training.scaled_grouped_mm import (
+from torchao.prototype.moe_training.mxfp8_grouped_mm import (
     _to_mxfp8_then_scaled_grouped_mm,
 )
 from torchao.prototype.mx_formats.mx_tensor import MXTensor
@@ -157,7 +157,7 @@ class TestIntegration(MultiProcessTestCase):
                 input_tensor,
                 output_splits.tolist(),
                 input_splits.tolist(),
-                group=group,
+                group_name=group.group_name,
             )
             assert isinstance(mx_dispatched, MXTensor)
 
@@ -231,8 +231,6 @@ class TestIntegration(MultiProcessTestCase):
                 expert_weights.transpose(-2, -1),
                 offs=mx_group_offsets,
                 block_size=block_size,
-                # TODO: why does CUDA blocked layout throw an error in this test, but works in e2e torchtitan runs?
-                use_cuda_kernel_for_blocked_layout=False,
                 # wgrad_with_hp must be true if inputs are pre-quantized (MXTensor)
                 wgrad_with_hp=True,
             )
@@ -294,7 +292,7 @@ class TestIntegration(MultiProcessTestCase):
                 mx_unpermuted,
                 output_splits=input_splits.tolist(),
                 input_splits=output_splits.tolist(),
-                group=group,
+                group_name=group.group_name,
             )
             assert mxfp8_output.dtype == torch.bfloat16
 

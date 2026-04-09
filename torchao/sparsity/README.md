@@ -59,6 +59,30 @@ model = model.cuda()
 quantize_(model, Int8DynamicActivationInt8WeightConfig(layout=SemiSparseLayout()))
 ```
 
+### FP8 dynamic activation + FP8 weight + 2:4 sparsity (current status)
+
+For inference, we currently support FP8 dynamic activation + FP8 weight quantization composed with 2:4 **weight** sparsity through the CUTLASS sparse packing path:
+
+```py
+from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
+from torchao.quantization.quantize_.workflows import Float8PackingFormat
+
+quantize_(
+    model,
+    Float8DynamicActivationFloat8WeightConfig(
+        version=2,
+        granularity=PerRow(),
+        packing_format=Float8PackingFormat.SPARSE_CUTLASS,
+    ),
+)
+```
+
+Notes:
+- This path is implemented by `Sparse2x4CUTLASSFloat8Tensor` and validated in `test/quantization/quantize_/workflows/float8/test_sparse_2x4_cutlass_float8_tensor.py`.
+- It requires SM90+ GPUs (for example H100).
+- The repository does **not** currently contain a landed public API for FP8 composition with 2:4 **activation** sparsity.
+- `benchmarks/benchmark_e2e_fp8_sparse_linear.py` references a prototype config (`SRELUFloat8SemiSparseDynamicActivationFloat8WeightConfig`) that is not present in this tree.
+
 ### 2:4 sparsity
 
 ```py
