@@ -52,13 +52,20 @@ class FP8IdentitySemiSparseActivationLinear(nn.Module):
         self.activation_dtype = activation_dtype
         self.use_fused_row_absmax = use_fused_row_absmax
 
-        w_aqt = _float8_cutlass_quant(weight, weight_dtype)
-        self.wq = w_aqt.tensor_impl.float8_data  # [N, K]
-        self.w_scale = w_aqt.tensor_impl.scale.squeeze(-1)  # [N]
+        device = weight.device
+        # 避免在 GPU 上与 BF16 权重叠加峰值导致 OOM：CPU 上量化后再搬回 GPU。
+        w_src = weight.detach()
+        if w_src.is_cuda:
+            w_src = w_src.cpu()
+        w_aqt = _float8_cutlass_quant(w_src, weight_dtype)
+        self.wq = w_aqt.tensor_impl.float8_data.to(device, non_blocking=True)
+        self.w_scale = w_aqt.tensor_impl.scale.squeeze(-1).to(
+            device, non_blocking=True
+        )
         inv_max = 1.0 / torch.finfo(activation_dtype).max
         self.register_buffer(
             "_fp8_inv_max",
-            torch.tensor(inv_max, dtype=torch.float32, device=weight.device),
+            torch.tensor(inv_max, dtype=torch.float32, device=device),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

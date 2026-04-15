@@ -382,3 +382,6 @@ torchao/experimental/deps
 # local claude code files
 CLAUDE.local.md
 .claude
+
+results/
+.hf_cache/

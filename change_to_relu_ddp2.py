@@ -40,6 +40,7 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader, TensorDataset
 import json
 import glob
+from transformers.modeling_utils import load_sharded_checkpoint
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -103,7 +104,8 @@ class LlamaMLPReluTransition(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                self._sparsity_frac = (h.abs() < 1e-6).float().mean().item()
+                # self._sparsity_frac = (h.abs() < 1e-6).float().mean().item()
+                self._sparsity_frac = (gate <= 0).float().mean().item()
             # 仅在训练循环需要稀疏惩罚时应用挂载，且避免 checkpointing 内存泄漏
             coeff = getattr(self, '_penalty_coeff', 0.0)
             if coeff > 0.0:
@@ -227,6 +229,49 @@ def estimate_relu_scale_and_bias(model: nn.Module, calib_ids: torch.Tensor,
     return layer_scales, layer_biases
 
 
+def load_model_only_checkpoint(model: nn.Module, ckpt_dir: str, accelerator=None):
+    """
+    只加载 checkpoint/hf_model 中的模型参数，不恢复 optimizer / scheduler。
+    返回: (step, alpha)
+    """
+    hf_dir = os.path.join(ckpt_dir, "hf_model")
+    if not os.path.isdir(hf_dir):
+        raise FileNotFoundError(f"找不到 hf_model 目录: {hf_dir}")
+
+    # 1) 加载模型权重
+    index_file = os.path.join(hf_dir, "pytorch_model.bin.index.json")
+    single_file = os.path.join(hf_dir, "pytorch_model.bin")
+
+    if os.path.exists(index_file):
+        # 分片权重
+        load_sharded_checkpoint(model, hf_dir, strict=False)
+    elif os.path.exists(single_file):
+        # 单文件权重
+        state_dict = torch.load(single_file, map_location="cpu")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if accelerator is None or accelerator.is_main_process:
+            print(f"[model-only resume] missing={len(missing)}, unexpected={len(unexpected)}")
+    else:
+        raise FileNotFoundError(
+            f"在 {hf_dir} 下既没找到 pytorch_model.bin，也没找到 pytorch_model.bin.index.json"
+        )
+
+    # 2) 读取 step / alpha
+    step = 0
+    alpha = 0.0
+    state_file = os.path.join(ckpt_dir, "custom_state.json")
+    if os.path.exists(state_file):
+        with open(state_file, "r") as f:
+            state = json.load(f)
+        step = int(state.get("step", 0))
+        alpha = float(state.get("alpha", 0.0))
+
+    set_alpha(model, alpha)
+
+    if accelerator is None or accelerator.is_main_process:
+        print(f"[model-only resume] 已加载模型权重，step={step}, alpha={alpha:.6f}")
+
+    return step, alpha
 
 def replace_all_mlp(model: nn.Module, alpha: float = 0.0,
                     calib_ids: Optional[torch.Tensor] = None) -> int:
@@ -653,30 +698,70 @@ def train(args, model: nn.Module, tokenizer, teacher_model: Optional[nn.Module] 
     data_iterator = infinite_dataloader(dataloader)
 
     # ── 断点接续 (Resume) 的恢复逻辑 ───────────────────────────────────────
+    # step = 0
+    # if args.resume_from_checkpoint:
+    #     if os.path.exists(args.resume_from_checkpoint):
+    #         if accelerator.is_main_process:
+    #             print(f"\n正在从 {args.resume_from_checkpoint} 恢复训练...")
+    #         # 兼容旧 checkpoint：补齐缺失的非 rank-0 random_states 文件
+    #         rank0_rng = os.path.join(args.resume_from_checkpoint, "random_states_0.pkl")
+    #         if os.path.exists(rank0_rng):
+    #             import shutil
+    #             for ri in range(accelerator.num_processes):
+    #                 target_rng = os.path.join(
+    #                     args.resume_from_checkpoint, f"random_states_{ri}.pkl")
+    #                 if not os.path.exists(target_rng):
+    #                     shutil.copy2(rank0_rng, target_rng)
+    #                     if accelerator.is_main_process:
+    #                         print(f"  [兼容] 复制 random_states_0 -> random_states_{ri}")
+    #         accelerator.load_state(args.resume_from_checkpoint)
+    #         state_file = os.path.join(args.resume_from_checkpoint, "custom_state.json")
+    #         if os.path.exists(state_file):
+    #             with open(state_file, "r") as f:
+    #                 state = json.load(f)
+    #                 step = state.get("step", 0)
+
+    #         alpha_scheduler.step(step)
     step = 0
     if args.resume_from_checkpoint:
         if os.path.exists(args.resume_from_checkpoint):
             if accelerator.is_main_process:
                 print(f"\n正在从 {args.resume_from_checkpoint} 恢复训练...")
-            # 兼容旧 checkpoint：补齐缺失的非 rank-0 random_states 文件
-            rank0_rng = os.path.join(args.resume_from_checkpoint, "random_states_0.pkl")
-            if os.path.exists(rank0_rng):
-                import shutil
-                for ri in range(accelerator.num_processes):
-                    target_rng = os.path.join(
-                        args.resume_from_checkpoint, f"random_states_{ri}.pkl")
-                    if not os.path.exists(target_rng):
-                        shutil.copy2(rank0_rng, target_rng)
-                        if accelerator.is_main_process:
-                            print(f"  [兼容] 复制 random_states_0 -> random_states_{ri}")
-            accelerator.load_state(args.resume_from_checkpoint)
-            state_file = os.path.join(args.resume_from_checkpoint, "custom_state.json")
-            if os.path.exists(state_file):
-                with open(state_file, "r") as f:
-                    state = json.load(f)
-                    step = state.get("step", 0)
 
-            alpha_scheduler.step(step)
+            if args.resume_model_only:
+                # 只恢复模型参数 + step/alpha
+                unwrapped = accelerator.unwrap_model(model)
+                step, alpha = load_model_only_checkpoint(
+                    unwrapped,
+                    args.resume_from_checkpoint,
+                    accelerator=accelerator
+                )
+                alpha_scheduler.step(step)
+
+                if accelerator.is_main_process:
+                    print(f"成功恢复模型权重到第 {step} 步，重新初始化优化器和调度器。")
+            else:
+                # 原来的完整恢复逻辑
+                rank0_rng = os.path.join(args.resume_from_checkpoint, "random_states_0.pkl")
+                if os.path.exists(rank0_rng):
+                    import shutil
+                    for ri in range(accelerator.num_processes):
+                        target_rng = os.path.join(
+                            args.resume_from_checkpoint, f"random_states_{ri}.pkl")
+                        if not os.path.exists(target_rng):
+                            shutil.copy2(rank0_rng, target_rng)
+                            if accelerator.is_main_process:
+                                print(f"  [兼容] 复制 random_states_0 -> random_states_{ri}")
+
+                accelerator.load_state(args.resume_from_checkpoint)
+
+                state_file = os.path.join(args.resume_from_checkpoint, "custom_state.json")
+                if os.path.exists(state_file):
+                    with open(state_file, "r") as f:
+                        state = json.load(f)
+                        step = state.get("step", 0)
+
+                alpha_scheduler.step(step)
 
             if accelerator.is_main_process:
                 print(f"成功恢复到第 {step} 步，开始接续训练。")
@@ -901,7 +986,11 @@ def main() -> None:
     p.add_argument("--monitor_sparsity", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--resume_from_checkpoint", type=str, default=None, help="恢复训练的checkpoint目录")
     p.add_argument("--train_data_pt", type=str, default="/data/sza/local_dataset/train_data_4B.pt", help="预处理好的数据张量文件")
-    
+    p.add_argument(
+    "--resume_model_only",
+    action="store_true",
+    help="只恢复模型权重和step/alpha，不恢复optimizer/scheduler状态"
+    )
     args = p.parse_args()
 
     from accelerate import InitProcessGroupKwargs
